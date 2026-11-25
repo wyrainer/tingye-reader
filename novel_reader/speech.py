@@ -7,9 +7,10 @@ from pathlib import Path
 from queue import SimpleQueue
 from threading import Lock
 
+from .model_paths import MODEL, missing_files
+
 
 RATE = 24000
-MODEL = "zipvoice-distill-fp32"
 
 # Closing quotes and brackets belong to the sentence they close. A period
 # inside a number or an English word is not a sentence terminator.
@@ -62,6 +63,19 @@ class Passage:
     text: str
 
 
+@dataclass(frozen=True)
+class VoiceSettings:
+    steps: int = 4
+    speed: float = 1.0
+    guidance: float = 3.0
+    softness: int = 0
+
+    def __post_init__(self):
+        if (self.steps not in (4, 8) or not .75 <= self.speed <= 1.25
+                or not 1 <= self.guidance <= 4 or not 0 <= self.softness <= 100):
+            raise ValueError("语音参数超出可调范围。")
+
+
 class Pacing:
     def __init__(self):
         self.characters_per_second = 5.0
@@ -97,6 +111,26 @@ class Pacing:
 
 _PAUSE = re.compile(r"""(?:[。！？!?；;]+|…+|\.+(?=\s|$|[”’」』）》"'])|[，、：]|(?<!\d)[,:]|[,:](?!\d))[”’」』）》】)\]"']*""")
 _STRONG = "。！？!?；;.…"
+_DIALOGUE = re.compile(r"""[ \t\u200b\ufeff]*[“‘「『"]""")
+_ASCII_WORD = re.compile(r"[A-Za-z0-9]+(?:[.'’,-][A-Za-z0-9]+)*")
+
+
+def nearest_word_end(text, start, target):
+    import logging
+    import jieba
+
+    # Tokenize only the local context. The offsets refer to the original EPUB.
+    jieba.setLogLevel(logging.WARNING)
+    window = text[start:start + target + 32]
+    for token in _ASCII_WORD.finditer(text, start, start + target):
+        if token.end() == start + target:
+            full = _ASCII_WORD.match(text, token.start())
+            return full.end() if token.start() == start else min(
+                (full.end(), token.start()), key=lambda i: abs(i - start - target))
+    for _, left, right in jieba.tokenize(window):
+        if right >= target:
+            return start + (left if left and target - left < right - target else right)
+    return start + len(window)
 
 
 def passage_end(text, start, target, first):
@@ -110,8 +144,10 @@ def passage_end(text, start, target, first):
         if match.start() >= stop:
             break
         end = match.end()
+        if text[match.start()] in "：:" and _DIALOGUE.match(text, match.start() + 1):
+            continue
         if end - start >= minimum:
-            penalty = 0 if text[match.start()] in _STRONG else 5
+            penalty = 0 if text[match.start()] in _STRONG else (9 if first else 17)
             candidates.append((abs(end - start - target) + penalty, end, penalty == 0))
     if newline >= 0 or stop == len(text):
         candidates.append((abs(stop - start - target), stop, True))
@@ -122,26 +158,26 @@ def passage_end(text, start, target, first):
         # Include a tiny tail when its natural boundary is only a few letters away.
         return max((point for _, point, terminal in candidates if terminal and end < point <= end + 5), default=end)
 
-    # A long clause with no punctuation: use whitespace where available.
-    end = start + target
+    # Keep explicit spaces, dictionary words and Latin tokens intact on long clauses.
     spaces = [i for i in range(start + minimum, stop) if text[i].isspace()]
     if spaces:
-        return min(spaces, key=lambda i: abs(i - end))
-    while end < stop and text[end - 1].isascii() and text[end - 1].isalnum() and text[end].isascii() and text[end].isalnum():
-        end += 1
-    return end
+        return min(spaces, key=lambda i: abs(i - (start + target)))
+    return nearest_word_end(text, start, target)
 
 
 def next_passage(book, position, limit, first=False):
     doc, start = position
     while doc < len(book.docs):
         text, _ = book.document(doc)
-        while start < len(text) and not text[start].isalnum():
+        while start < len(text) and not text[start].isalnum() and text[start] not in "“‘「『\"":
             start += 1
         if start >= len(text):
             doc, start = doc + 1, 0
             continue
         end = passage_end(text, start, limit, first)
+        if not any(c.isalnum() for c in text[start:end]):
+            start = end
+            continue
         return Passage(doc, start, end, text[start:end])
     return None
 
@@ -152,16 +188,16 @@ def synthesis_worker(model_dir, requests, replies, epoch):
         import sherpa_onnx as sherpa
         import soundfile as sf
 
+        missing = missing_files(Path(model_dir))
+        if missing:
+            raise FileNotFoundError(f"模型文件缺失：{missing[0]}")
         os.chdir(model_dir)
         files = Path(MODEL)
-        required = [files / name for name in ("text_encoder.onnx", "fm_decoder.onnx", "tokens.txt", "lexicon.txt")]
         reference = Path("reader-reference-distill-zh.wav")
-        for path in [*required, Path("vocos_24khz.onnx"), Path("lexicon-en-us.txt"), reference]:
-            if not path.is_file():
-                raise FileNotFoundError(f"缺少离线文件 {path}")
         model = sherpa.OfflineTtsZipvoiceModelConfig(
-            encoder=str(required[0]), decoder=str(required[1]), tokens=str(required[2]),
-            lexicon=f"{required[3]},lexicon-en-us.txt", vocoder="vocos_24khz.onnx", guidance_scale=3.0,
+            encoder=str(files / "text_encoder.onnx"), decoder=str(files / "fm_decoder.onnx"),
+            tokens=str(files / "tokens.txt"), lexicon=f"{files / 'lexicon.txt'},lexicon-en-us.txt",
+            vocoder="vocos_24khz.onnx", guidance_scale=3.0,
         )
         config = sherpa.OfflineTtsConfig(model=sherpa.OfflineTtsModelConfig(
             zipvoice=model, num_threads=4, provider="cpu"))
@@ -173,7 +209,6 @@ def synthesis_worker(model_dir, requests, replies, epoch):
         voice.reference_audio, voice.reference_sample_rate = prompt, rate
         voice.reference_text = "乍看之下，一切的困扰仿佛都围绕在我身边。"
         voice.silence_scale = 1.0
-        voice.extra = {"min_words_in_sentence": "22", "max_words_in_sentence": "100", "step_progress": "1"}
         replies.put(("ready",))
     except Exception as exc:
         replies.put(("fatal", str(exc)))
@@ -182,13 +217,20 @@ def synthesis_worker(model_dir, requests, replies, epoch):
         request = requests.get()
         if request is None:
             break
-        generation, span, steps = request
+        generation, span, settings = request
         if generation != epoch.value:
             continue
         try:
-            voice.num_steps = steps
+            voice.num_steps = settings.steps
+            voice.speed = settings.speed
+            utterance = spoken_text(span.text)
+            # Keep each app-selected passage together through the engine's
+            # punctuation split/merge, including its closing quotation marks.
+            unit_limit = str(min(160, len(utterance) + 1))
+            voice.extra = {"min_words_in_sentence": unit_limit, "max_words_in_sentence": unit_limit,
+                           "step_progress": "1", "guidance_scale": str(settings.guidance)}
             started = time.perf_counter()
-            result = engine.generate(spoken_text(span.text), voice, lambda samples, progress: int(epoch.value == generation))
+            result = engine.generate(utterance, voice, lambda samples, progress: int(epoch.value == generation))
             if epoch.value != generation:
                 continue
             samples = np.asarray(result.samples, dtype=np.float32)
@@ -197,6 +239,11 @@ def synthesis_worker(model_dir, requests, replies, epoch):
                 continue
             if result.sample_rate != RATE or not np.isfinite(samples).all():
                 raise ValueError("该片段未生成有效语音。")
+            if settings.softness:
+                # Blend with a symmetric low-pass filter, preserving length and timing.
+                padded = np.pad(samples, 1, mode="edge")
+                amount = settings.softness / 400
+                samples = (1 - 2 * amount) * samples + amount * (padded[:-2] + padded[2:])
             # Preserve peak shape and leave headroom when converting Vocos output to PCM.
             gain = .94 / max(1.0, float(np.max(np.abs(samples))))
             pcm = (samples * (gain * 32767)).astype("<i2").tobytes()

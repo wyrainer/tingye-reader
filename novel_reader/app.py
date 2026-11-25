@@ -10,7 +10,9 @@ from queue import Empty
 from tkinter import filedialog, messagebox, ttk
 
 from .book import Book
-from .speech import AudioPlayer, Pacing, next_passage, sentence_start, synthesis_worker
+from .model_paths import PACK, locate_models, missing_files
+from .speech import AudioPlayer, Pacing, Passage, VoiceSettings, next_passage, sentence_start, synthesis_worker
+from .voice_panel import VoicePanel
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,18 +56,57 @@ class Reader:
         self.db.execute("CREATE TABLE IF NOT EXISTS preferences (name TEXT PRIMARY KEY, value TEXT)")
         saved_mode = self.db.execute("SELECT value FROM preferences WHERE name='voice_mode'").fetchone()
         self.voice_mode = tk.StringVar(value=saved_mode[0] if saved_mode and saved_mode[0] in VOICE_MODES else next(iter(VOICE_MODES)))
+        prefs = dict(self.db.execute("SELECT name,value FROM preferences"))
+        steps = VOICE_MODES[self.voice_mode.get()]
+        try:
+            self.settings = VoiceSettings(steps, float(prefs.get("speed", 1)),
+                                          float(prefs.get("guidance", 3)), int(prefs.get("softness", 0)))
+        except (ValueError, TypeError):
+            self.settings = VoiceSettings(steps)
+        self.voice_panel = None
+        self.previewing = self.preview_playing = False
+        self.resume_after_preview = None
         context = mp.get_context("spawn")
         self.epoch = context.Value("L", 0)
         self.requests, self.replies = context.Queue(), context.Queue()
-        self.worker = context.Process(target=synthesis_worker, daemon=True,
-                                      args=(str(ROOT / "models"), self.requests, self.replies, self.epoch))
+        self.worker = None
         self.layout()
-        self.worker.start()
+        key = f"model_path:{PACK}"
+        exe = Path(sys.executable) if getattr(sys, "frozen", False) else None
+        model_dir = locate_models(ROOT, exe, prefs.get(key))
+        if model_dir is None:
+            model_dir = self.choose_models()
+            if model_dir:
+                with self.db:
+                    self.db.execute("INSERT OR REPLACE INTO preferences VALUES(?,?)", (key, str(model_dir)))
+        if model_dir:
+            self.worker = context.Process(target=synthesis_worker, daemon=True,
+                                          args=(str(model_dir), self.requests, self.replies, self.epoch))
+            self.worker.start()
+        else:
+            self.failure = "未选择模型。重新打开听页可选择模型文件夹。"
+            self.status.set(self.failure)
         root.protocol("WM_DELETE_WINDOW", self.close)
         root.bind("<Control-o>", lambda e: self.choose())
         root.bind("<Control-Return>", lambda e: self.start())
         root.bind("<space>", self.space)
         self.timer = root.after(35, self.tick)
+
+    def choose_models(self):
+        while True:
+            selected = filedialog.askdirectory(parent=self.root, mustexist=True,
+                                               title=f"选择模型库或模型文件夹 {PACK}")
+            if not selected:
+                return None
+            folder = Path(selected)
+            if folder.name != PACK:
+                folder = folder / PACK
+            missing = missing_files(folder)
+            if not missing:
+                return folder
+            messagebox.showwarning("模型文件不齐全",
+                                   f"请选择包含完整 {PACK} 的模型库，或该版本文件夹。\n"
+                                   f"缺少文件：{missing[0]}", parent=self.root)
 
     def layout(self):
         style = ttk.Style(self.root)
@@ -79,6 +120,7 @@ class Reader:
         mode = ttk.Combobox(header, textvariable=self.voice_mode, values=list(VOICE_MODES), state="readonly", width=11)
         mode.pack(side="right", padx=12)
         mode.bind("<<ComboboxSelected>>", self.change_voice_mode)
+        self.button(header, "语音调节…", self.open_voice_panel).pack(side="right")
 
         footer = tk.Frame(self.root, bg=SIDE, padx=20, pady=12)
         footer.pack(side="bottom", fill="x")
@@ -295,15 +337,70 @@ class Reader:
         self.status.set("正在准备首句…" if self.ready else "正在加载本地模型…")
 
     def change_voice_mode(self, event=None):
+        s = self.settings
+        self.apply_settings(VoiceSettings(VOICE_MODES[self.voice_mode.get()], s.speed, s.guidance, s.softness))
+
+    def apply_settings(self, settings):
+        if settings == self.settings:
+            return
+        mode = next(name for name, steps in VOICE_MODES.items() if steps == settings.steps)
+        with self.db:
+            self.db.executemany("INSERT OR REPLACE INTO preferences VALUES(?,?)",
+                                [("voice_mode", mode), ("speed", settings.speed),
+                                 ("guidance", settings.guidance), ("softness", settings.softness)])
+        self.voice_mode.set(mode)
+        self.settings = settings
         self.pacing = Pacing()
-        self.db.execute("INSERT OR REPLACE INTO preferences VALUES('voice_mode', ?)", (self.voice_mode.get(),))
-        self.db.commit()
         if self.active:
             paused = self.paused
             point = (self.audible.doc, self.audible.start) if self.audible else self.play_origin
             self.start(point)
             if paused:
                 self.toggle()
+
+    def open_voice_panel(self):
+        if self.voice_panel is None:
+            self.voice_panel = VoicePanel(self)
+        else:
+            self.voice_panel.lift()
+
+    def preview_voice(self, text, settings):
+        if self.failure:
+            return
+        if self.active:
+            point = (self.audible.doc, self.audible.start) if self.audible else self.play_origin
+            self.resume_after_preview = (point, self.paused)
+        if not self.previewing and self.resume_after_preview is None:
+            self.status_before_preview = self.status.get()
+        self.invalidate()
+        self.previewing, self.preview_playing = True, False
+        self.voice_panel.stop.state(["!disabled"])
+        self.voice_panel.feedback.set("正在本地合成试听…" if self.ready else "正在加载本地模型…")
+        self.status.set("语音试听中")
+        self.requests.put((self.epoch.value, Passage(-1, 0, len(text), text), settings))
+
+    def stop_preview(self, message="试听已停止"):
+        if self.previewing:
+            self.invalidate()
+            self.previewing = self.preview_playing = False
+            self.voice_panel.stop.state(["disabled"])
+            self.voice_panel.feedback.set(message)
+            self.status.set("关闭语音调节后返回正文" if self.resume_after_preview else self.status_before_preview)
+
+    def close_voice_panel(self, save=False):
+        panel = self.voice_panel
+        if save:
+            self.apply_settings(panel.values())
+        self.stop_preview()
+        panel.destroy()
+        self.voice_panel = None
+        if self.resume_after_preview is not None:
+            point, paused = self.resume_after_preview
+            self.resume_after_preview = None
+            if not self.failure:
+                self.start(point)
+                if paused:
+                    self.toggle()
 
     def toggle(self):
         if self.active:
@@ -351,6 +448,14 @@ class Reader:
             elif msg[0] == "fatal":
                 raise WorkerUnavailable(msg[1])
             elif msg[1] == self.epoch.value:
+                if self.previewing:
+                    if msg[0] == "audio":
+                        self.player.append(msg[2], msg[3])
+                        self.preview_playing = True
+                        self.voice_panel.feedback.set("正在播放试听…")
+                    else:
+                        self.stop_preview(msg[2] if msg[0] == "error" else "这段文字未能发音，请换一句试听。")
+                    continue
                 if msg[0] == "error":
                     raise ValueError(msg[2])
                 if msg[0] == "unvoiced":
@@ -368,6 +473,12 @@ class Reader:
                     self.player.append(span, pcm)
         if not self.worker.is_alive() and self.worker.exitcode is not None:
             raise WorkerUnavailable("语音进程已退出。请关闭并重新打开听页。")
+        if self.previewing:
+            if self.preview_playing and self.player.stream is not None and not self.player.stream.active:
+                self.stop_preview("音频输出已中断，请检查播放设备后重新试听。")
+            elif self.preview_playing and self.player.buffered() <= 0:
+                self.stop_preview("试听结束，可调整后再次试听。")
+            return
         while not self.player.events.empty():
             self.pending_marks.append(self.player.events.get())
         while self.pending_marks and self.pending_marks[0][0] <= time.monotonic():
@@ -393,7 +504,7 @@ class Reader:
                 self.eof = True
                 self.release_opening()
             else:
-                self.requests.put((self.epoch.value, span, VOICE_MODES[self.voice_mode.get()]))
+                self.requests.put((self.epoch.value, span, self.settings))
                 self.position = (span.doc, span.end)
                 self.busy = True
                 if self.opening_audio and not self.opening_deadline:
@@ -413,10 +524,14 @@ class Reader:
             if not self.failure:
                 self.poll()
         except Exception as exc:
+            self.stop_preview(str(exc))
             self.invalidate()
             if isinstance(exc, WorkerUnavailable) or not self.worker.is_alive():
                 self.failure = str(exc)
                 self.play_button.config(state="disabled")
+                if self.voice_panel is not None:
+                    self.voice_panel.listen.state(["disabled"])
+                    self.voice_panel.feedback.set(self.failure)
             self.status.set("朗读已中止")
             messagebox.showerror("朗读遇到问题", str(exc), parent=self.root)
         if not self.closed:
@@ -428,11 +543,12 @@ class Reader:
         self.closed = True
         self.root.after_cancel(self.timer)
         self.invalidate()
-        self.requests.put(None)
-        self.worker.join(.5)
-        if self.worker.is_alive():
-            self.worker.terminate()
-            self.worker.join(1)
+        if self.worker is not None:
+            self.requests.put(None)
+            self.worker.join(.5)
+            if self.worker.is_alive():
+                self.worker.terminate()
+                self.worker.join(1)
         if self.book:
             self.book.close()
         self.db.close()

@@ -1,6 +1,20 @@
 # 听页
 
-Windows 本地 EPUB 小说朗读器。双击 **发布/连读优化版/听页/听页.exe**，也可以把 EPUB 文件拖到 EXE 上。复制到其他 Windows x64 电脑时，请复制整个“听页”文件夹，其中包含 Python、模型和音频运行库。
+Windows 本地 EPUB 小说朗读器。双击 **发布/程序/语气衔接版/听页/听页.exe**，也可以把 EPUB 文件拖到 EXE 上。
+
+## 安装与更新
+
+首次使用时，将 **程序** 和 **模型库** 放在同一个目录下：
+
+```text
+发布/
+├─ 程序/语气衔接版/听页/
+│  ├─ 听页.exe
+│  └─ _internal/
+└─ 模型库/zipvoice-distill-fp32-v1/
+```
+
+以后只需把新版的整个程序文件夹放到“程序”下。模型库可供多个版本共用。换电脑时复制需要的程序版本和一份模型库，保留上述相对位置即可。模型也可以放在其他磁盘。程序在约定位置找不到完整模型时，会提示选择模型库或其中的 **zipvoice-distill-fp32-v1** 文件夹，选择成功后会记住位置。
 
 ## 使用
 
@@ -10,14 +24,16 @@ Windows 本地 EPUB 小说朗读器。双击 **发布/连读优化版/听页/听
 4. 播放按 EPUB 的阅读顺序自动进入下一章，直至书末。再次打开同一文件时会定位到上次播到的片段。书签存放在当前 Windows 用户的 LocalAppData/TingYe 中。
 5. 右上角可切换 **流畅 · 4步** 和 **精细 · 8步**。两档使用相同的中文音色。默认使用 4 步，8 步与官网 Distill 试听的推理步数一致。切换时从当前片段开头重新合成，并记住选择。
 
+点 **语音调节…** 可查看当前生效的参数，调整步数、语速、模型引导强度和高频柔化。每项旁边都有说明。输入书里的一句话，点 **试听当前设置** 即可比较听感。**恢复默认** 会把面板调回 4 步、1.00 倍速、引导强度 3.00、柔化 0%。点 **保存并关闭** 才会把面板的数值用于正文，并在下次启动时载入。若在听书时试听，关闭面板后会从原朗读片段开头恢复，原来暂停的会继续暂停。
+
 ## 本地运行
 
 界面使用 Python 自带的 Tk。独立进程预加载 ZipVoice-Distill 的 FP32 编码器、解码器和 Vocos 声码器，在 CPU 上合成。开始或跳读时，首段以约四秒语音为目标，在附近的句末或分句标点收束。很短的逗号引子会与后文合并。首段生成后立即准备下一段，根据首段的可播时长和下一段预计合成耗时决定何时出声。只有短标题时会等下一段就绪；书末直接播放。后续根据实测速度和缓冲量调整片段长度。正文按需读取，最多保留四个正文文件。
 
-运行源码时可以双击 **启动听页.cmd**。本目录的 .venv 已备好运行依赖。重新搭建环境时使用带 Tk 的 Windows x64 Python，按 requirements.txt 安装依赖。重新打包可在此环境安装 PyInstaller 后，用 PowerShell 7 执行 build.ps1。模型目录需要包含以下文件：
+运行源码时可以双击 **启动听页.cmd**。重新搭建环境时使用带 Tk 的 Windows x64 Python 创建 .venv，按 requirements.txt 安装依赖。源码优先读取上述共享目录，也兼容原有的项目 models 目录。安装 PyInstaller 后，用 PowerShell 7 执行 build.ps1 即可打包程序。发布其他版本可指定新的目录，例如 `./build.ps1 -DistPath '发布/程序/下一版'`。以下路径均相对于模型包根目录：
 
-- models/zipvoice-distill-fp32/ 中的 text_encoder.onnx、fm_decoder.onnx、lexicon.txt 和 tokens.txt
-- models/vocos_24khz.onnx 和 models/lexicon-en-us.txt
-- models/reader-reference-distill-zh.wav，官网跨语言试听第一行最右侧中文音频中 3.47 至 7.60 秒的片段，与推理配置中的中文逐字稿配套
+- zipvoice-distill-fp32/ 中的 text_encoder.onnx、fm_decoder.onnx、lexicon.txt 和 tokens.txt
+- vocos_24khz.onnx 和 lexicon-en-us.txt
+- reader-reference-distill-zh.wav，官网跨语言试听第一行最右侧中文音频中 3.47 至 7.60 秒的片段，与推理配置中的中文逐字稿配套
 
 模型与运行环境齐备后，首次启动、打开小说和语音合成均可断网运行。当前版本面向无 DRM、正文为文字的 EPUB，图片文字识别不在此版本范围内。

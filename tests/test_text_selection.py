@@ -8,7 +8,7 @@ from unittest.mock import patch
 from zipfile import ZipFile
 
 from novel_reader.app import Reader
-from novel_reader.speech import Passage, sentence_start
+from novel_reader.speech import Passage, VoiceSettings, sentence_start
 
 
 class SentenceTests(unittest.TestCase):
@@ -32,7 +32,8 @@ class TextSelectionTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         root = tk.Tk()
         self.root = root
-        with patch.object(mp.get_context("spawn").Process, "start"):
+        with (patch.object(mp.get_context("spawn").Process, "start"),
+              patch("novel_reader.app.locate_models", return_value=Path(tmp.name))):
             self.reader = Reader(root, Path(tmp.name) / "progress.sqlite3")
         root.after_cancel(self.reader.timer)
         self.addCleanup(self.close)
@@ -113,9 +114,48 @@ class TextSelectionTests(unittest.TestCase):
         self.assertEqual(app.position, (0, 4))
         app.ready = True
         app.poll()
-        generation, span, steps = app.requests.get(timeout=1)
-        self.assertEqual((generation, span.start, steps), (app.epoch.value, 4, 8))
+        generation, span, settings = app.requests.get(timeout=1)
+        self.assertEqual((generation, span.start, settings.steps), (app.epoch.value, 4, 8))
         self.assertEqual(app.db.execute("SELECT value FROM preferences WHERE name='voice_mode'").fetchone()[0], "精细 · 8步")
+
+    def test_preview_from_paused_book_can_be_replaced_and_cancelled(self):
+        app = self.reader
+        app.start((0, 0))
+        app.highlight(Passage(0, 4, 11, self.text[4:11]))
+        app.toggle()
+        app.open_voice_panel()
+        panel = app.voice_panel
+        panel.speed.set(.85)
+        panel.preview()
+        old, _, draft = app.requests.get(timeout=1)
+        self.assertEqual(draft.speed, .85)
+        panel.guidance.set(2.5)
+        panel.preview()
+        current, sample, draft = app.requests.get(timeout=1)
+        with patch.object(app, "replies", Queue()), patch.object(app.player, "append") as append:
+            app.replies.put(("audio", old, sample, bytes(480), .1))
+            app.replies.put(("audio", current, sample, bytes(480), .1))
+            app.poll()
+            append.assert_called_once()
+        app.close_voice_panel()
+        self.assertEqual(app.settings, VoiceSettings())
+        self.assertEqual(app.position, (0, 4))
+        self.assertTrue(app.paused)
+        self.assertEqual(app.db.execute("SELECT offset FROM progress").fetchone(), (4,))
+
+    def test_voice_panel_saves_and_displays_current_values(self):
+        app = self.reader
+        app.open_voice_panel()
+        draft = VoiceSettings(8, 1.15, 2.5, 35)
+        app.voice_panel.set_values(draft)
+        app.close_voice_panel(save=True)
+        app.open_voice_panel()
+        self.assertEqual(app.voice_panel.values(), draft)
+        self.assertEqual(app.voice_mode.get(), "精细 · 8步")
+        app.voice_panel.set_values(VoiceSettings())
+        app.close_voice_panel()
+        self.assertEqual(app.settings, draft)
+        self.assertEqual(dict(app.db.execute("SELECT name,value FROM preferences"))["softness"], "35")
 
     def test_short_opening_waits_for_second_and_seek_discards_it(self):
         app = self.reader

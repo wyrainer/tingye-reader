@@ -77,5 +77,24 @@ class ReaderTests(unittest.TestCase):
         self.assertGreater(pacing.opening_delay(4, SimpleNamespace(text="字" * 24)), 0)
         self.assertEqual(pacing.opening_delay(.8, SimpleNamespace(text="标题后的正文。")), float("inf"))
 
+    def test_keep_dialogue_and_nearby_sentence_end(self):
+        question = '他沿着街道走到那座小桥跟前轻声问道：“今天还要过去吗？”'
+        scene = '山脚下那间已经很久没有人住过的屋子里，忽然亮起了一盏灯。'
+        body = question + "\n" + scene
+        book = SimpleNamespace(docs=["a"], document=lambda _: (body, {}))
+        self.assertEqual(next_passage(book, (0, 0), 14).text, question)
+        self.assertEqual(next_passage(book, (0, len(question)), 14).text, scene)
+        quote = body.index("“")
+        self.assertEqual(next_passage(book, (0, quote), 14).text, question[quote:])
+
+    def test_long_unpunctuated_phrase_uses_word_boundaries(self):
+        body = "他推开书房的窗户望着远处山脚下那座已经很久没有人居住的老宅慢慢回想起许多年前在这里发生的事情。"
+        book = SimpleNamespace(docs=["a"], document=lambda _: (body, {}))
+        for word in ("窗户", "山脚下"):
+            start = body.index(word)
+            for target in range(start + 1, start + len(word)):
+                span = next_passage(book, (0, 0), target)
+                self.assertFalse(start < span.end < start + len(word))
+
     def test_numeric_chapter_and_dates(self):
         self.assertEqual(spoken_text("第101章，2026年。第12回，003号。"), "第一百零一章，二零二六年。第十二回，零零三号。")
