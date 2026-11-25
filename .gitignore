@@ -1,0 +1,7 @@
+.venv/
+__pycache__/
+*.pyc
+/models/
+/试听/
+/发布/
+/build/
