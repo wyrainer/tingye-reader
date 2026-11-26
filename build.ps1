@@ -1,4 +1,4 @@
-param([string]$DistPath = '发布/程序/语气衔接版')
+﻿param([string]$DistPath = '发布/程序/对白自适应版')
 $ErrorActionPreference = 'Stop'
 Set-Location -LiteralPath $PSScriptRoot
 $python = Join-Path $PSScriptRoot '.venv\Scripts\python.exe'

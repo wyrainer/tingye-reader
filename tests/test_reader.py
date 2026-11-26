@@ -5,7 +5,8 @@ from types import SimpleNamespace
 from zipfile import ZipFile
 
 from novel_reader.book import Book
-from novel_reader.speech import Pacing, next_passage, spoken_text
+from novel_reader.speech import Pacing, prepare_passage, spoken_text
+from novel_reader.segments import Passage, next_passage, choose_cut
 
 
 class ReaderTests(unittest.TestCase):
@@ -35,40 +36,81 @@ class ReaderTests(unittest.TestCase):
         self.assertTrue(text[anchors["part"]:].lstrip().startswith("明月说"))
         self.assertEqual(self.book.docs[1], "OPS/first.xhtml")
 
-    def test_seek_and_continuity_from_every_character(self):
-        text, _ = self.book.document(0)
-        last, _ = self.book.document(1)
-        for offset in range(len(text) + 1):
-            position = (0, offset)
-            pieces = []
-            while span := next_passage(self.book, position, 12, first=not pieces):
-                pieces.append(span.text)
-                position = span.doc, span.end
-            spoken = lambda s: "".join(c for c in s if c.isalnum())
-            self.assertEqual(spoken("".join(pieces)), spoken(text[offset:] + last))
+    def test_rebalance_and_keep_closing_quote(self):
+        text = "甲" * 30 + "。”" + "乙" * 15 + "，" + "丙" * 20 + "。"
+        self.assertEqual(choose_cut(text, False), (32, False))
+        self.assertEqual(choose_cut(text[32:], False), (len(text) - 32, False))
 
-    def test_short_first_then_adaptive_lengths(self):
-        self.assertEqual(next_passage(self.book, (0, 0), 12, True).text, "出发。向前走。继续。")
-        self.assertEqual(next_passage(self.book, (0, 0), 24).text, "出发。向前走。继续。")
+    def test_turns_are_independent_of_buffer_and_length(self):
+        turns = ["梅振衣：“仙童怎么只说我？这可是明月的主意。”", "清风：“明月无心，你是有意。”",
+                 "知焰：“" + "随先生亲口说有能耐就试试，" * 5 + "求雷得雷又何怨？”"]
+        for target in (30, 45, 60):
+            text = "".join(turns)
+            for turn in turns:
+                end, added = choose_cut(text, target=target)
+                self.assertEqual((text[:end], added), (turn, False))
+                text = text[end:]
+
+    def test_quote_variants_and_attribution(self):
+        for turn in ['明月说：「他答『好。』你听见了吗？」', '清风说："明日再说。"','“好！”', '清风：明月无心，你是有意。']:
+            text = turn + "知焰：无心也罢。"
+            self.assertEqual(choose_cut(text), (len(turn), False))
+        text = "夜已经深了。明月说：“我们走吧。”"
+        self.assertEqual(choose_cut(text)[0], text.index("明月"))
+
+    def test_short_opening_and_numeric_punctuation(self):
+        text = "16岁时，所以大家都没再提起礼学堂的事情。"
+        self.assertEqual(choose_cut(text, target=30), (len(text), False))
+        for number in ("1,234.50", "１，２３４：５６"):
+            text = "甲" * 26 + number + "乙" * 28 + "。"
+            self.assertEqual(choose_cut(text), (len(text), False))
+
+    def test_long_dialogue_splits_within_one_speaker(self):
+        clauses = ["清风：“" + "甲" * 35 + "？", "乙" * 34 + "，", "丙" * 34 + "！”"]
+        text = "".join(clauses) + "明月说：“好。”"
+        self.assertEqual(choose_cut(text, target=30), (len(clauses[0]), False))
+        self.assertEqual(choose_cut(text[len(clauses[0]):], target=30),
+                         (len("".join(clauses[1:])), False))
+
+    def test_punctuation_cluster_and_soft_maximum(self):
+        prefix = "甲" * 30 + "……？！”"
+        self.assertEqual(choose_cut(prefix + "乙" * 32), (len(prefix), False))
+        self.assertEqual(choose_cut("甲" * 67 + "。"), (68, False))
+
+    def test_word_fallback_and_book_end(self):
+        text = "所以大家都没再提起礼学堂的事情" * 12
+        end, added = choose_cut(text)
+        self.assertTrue(added)
+        self.assertIn(end % 15, (0, 2, 4, 5, 6, 7, 9, 12, 13))
+        self.assertEqual(choose_cut("完。"), (2, False))
+
+    def test_paragraphs_and_chapters_preserve_source_offsets(self):
+        docs = ["短标题", "", "转眼到了午后。\n  风吹过树林。" + "远处传来了声音。" * 45, "最后一句。"]
+        book = SimpleNamespace(docs=docs, document=lambda i: (docs[i], {}))
+        position = (0, 0)
+        pieces = [[] for _ in docs]
+        while window := next_passage(book, position):
+            span, _ = prepare_passage(window, None)
+            self.assertNotIn("\n", span.text)
+            self.assertGreater(span.next_position, position)
+            self.assertEqual(docs[span.doc][span.start:span.end], span.text)
+            pieces[span.doc].append(span.text)
+            position = span.next_position
+        self.assertEqual(["".join(p) for p in pieces],
+                         [s.replace("\n", "").replace(" ", "") for s in docs])
+
+    def test_pacing_changes_real_narrative_cuts(self):
+        text = ("他们沿着小河慢慢地往前走去。" * 12)
         pacing = Pacing()
-        self.assertLess(pacing.limit(False, 0), pacing.limit(False, 15))
-        previous = pacing.limit(False, 5)
-        pacing.observe(35, 7, 14)
-        self.assertLess(pacing.limit(False, 5), previous)
-
-    def test_short_intro_and_punctuation_beyond_target(self):
-        intro = "16岁时，他第一次走进这所学堂。"
-        sentence = "所以大家都没再提起礼学堂的事情。"
-        text = intro + sentence + "下课以后，大家照常回家。"
-        book = SimpleNamespace(docs=["a"], document=lambda _: (text, {}))
-        self.assertEqual(next_passage(book, (0, 0), Pacing().limit(True, 0), True).text, intro)
-        for target in range(12, 20):
-            self.assertEqual(next_passage(book, (0, len(intro)), target).text, sentence)
-        # Numeric separators are not clause boundaries, and a closing quote
-        # stays with the statement even if the length target falls before it.
-        quoted = '他说：“价格是1,234.50元。”'
-        book.document = lambda _: (quoted + "\n下一段。", {})
-        self.assertEqual(next_passage(book, (0, 0), 14).text, quoted)
+        pacing.observe(50, 10, 5)
+        short = pacing.target_length(2)
+        full = pacing.target_length(9)
+        self.assertLess(choose_cut(text, target=short)[0], choose_cut(text, target=full)[0])
+        fast = full
+        for _ in range(5):
+            pacing.observe(50, 10, 14)
+        self.assertLess(pacing.target_length(9), fast)
+        self.assertEqual(pacing.target_length(0, opening=True), 30)
 
     def test_start_delay_accounts_for_next_job(self):
         pacing = Pacing()
@@ -76,25 +118,6 @@ class ReaderTests(unittest.TestCase):
         self.assertEqual(pacing.opening_delay(4, SimpleNamespace(text="很短。")), 0)
         self.assertGreater(pacing.opening_delay(4, SimpleNamespace(text="字" * 24)), 0)
         self.assertEqual(pacing.opening_delay(.8, SimpleNamespace(text="标题后的正文。")), float("inf"))
-
-    def test_keep_dialogue_and_nearby_sentence_end(self):
-        question = '他沿着街道走到那座小桥跟前轻声问道：“今天还要过去吗？”'
-        scene = '山脚下那间已经很久没有人住过的屋子里，忽然亮起了一盏灯。'
-        body = question + "\n" + scene
-        book = SimpleNamespace(docs=["a"], document=lambda _: (body, {}))
-        self.assertEqual(next_passage(book, (0, 0), 14).text, question)
-        self.assertEqual(next_passage(book, (0, len(question)), 14).text, scene)
-        quote = body.index("“")
-        self.assertEqual(next_passage(book, (0, quote), 14).text, question[quote:])
-
-    def test_long_unpunctuated_phrase_uses_word_boundaries(self):
-        body = "他推开书房的窗户望着远处山脚下那座已经很久没有人居住的老宅慢慢回想起许多年前在这里发生的事情。"
-        book = SimpleNamespace(docs=["a"], document=lambda _: (body, {}))
-        for word in ("窗户", "山脚下"):
-            start = body.index(word)
-            for target in range(start + 1, start + len(word)):
-                span = next_passage(book, (0, 0), target)
-                self.assertFalse(start < span.end < start + len(word))
 
     def test_numeric_chapter_and_dates(self):
         self.assertEqual(spoken_text("第101章，2026年。第12回，003号。"), "第一百零一章，二零二六年。第十二回，零零三号。")

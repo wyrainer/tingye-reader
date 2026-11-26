@@ -8,6 +8,9 @@ from queue import SimpleQueue
 from threading import Lock
 
 from .model_paths import MODEL, missing_files
+from .mac_speech import PROVIDERS, VOICES
+from .prosody import ChineseProsody, HAN, WETTS_PACK
+from .segments import DEFAULT_TARGET, MAX_TARGET, MIN_TARGET, SegmentError, choose_cut, spoken_count
 
 
 RATE = 24000
@@ -56,24 +59,21 @@ def spoken_text(text):
 
 
 @dataclass(frozen=True)
-class Passage:
-    doc: int
-    start: int
-    end: int
-    text: str
-
-
-@dataclass(frozen=True)
 class VoiceSettings:
     steps: int = 4
     speed: float = 1.0
     guidance: float = 3.0
     softness: int = 0
+    use_prosody: bool = True
+    provider: str = "zipvoice"
+    mac_voice: str = "male_1"
 
     def __post_init__(self):
         if (self.steps not in (4, 8) or not .75 <= self.speed <= 1.25
                 or not 1 <= self.guidance <= 4 or not 0 <= self.softness <= 100):
             raise ValueError("语音参数超出可调范围。")
+        if self.provider not in PROVIDERS or self.mac_voice not in VOICES:
+            raise ValueError("朗读服务或音色无效。")
 
 
 class Pacing:
@@ -92,94 +92,34 @@ class Pacing:
     def buffer_goal(self):
         return min(25, max(10, 16 * self.compute_ratio))
 
-    def limit(self, first, buffered):
-        if first:
-            return max(16, min(26, round(self.characters_per_second * 4.2)))
-        # With little audio left, prefer quick results. With sufficient runway,
-        # amortize model overhead across a longer phrase.
-        seconds = max(2.8, min(10, .76 * buffered / max(.15, self.compute_ratio)))
-        return max(14, min(65, round(self.characters_per_second * seconds)))
+    def target_length(self, buffered, *, opening=False):
+        # Leave a little runway for scheduling and audio output. A cold start
+        # gets a moderate first sentence even though its buffer is empty.
+        if opening:
+            return MIN_TARGET
+        affordable = max(0, buffered - .4) * self.characters_per_second / max(.05, self.compute_ratio)
+        return max(MIN_TARGET, min(MAX_TARGET, round(.85 * affordable)))
 
-    def opening_delay(self, prepared_seconds, upcoming):
-        # A stand-alone heading provides almost no runway. Start it as soon
-        # as the following audio arrives. EOF always releases it immediately.
+    def opening_delay(self, prepared_seconds, upcoming, target=DEFAULT_TARGET):
         if prepared_seconds < 1.8:
             return float("inf")
-        estimate = len(upcoming.text) / self.characters_per_second * self.compute_ratio
+        end, _ = choose_cut(upcoming.text, getattr(upcoming, "more", False), target)
+        estimate = spoken_count(upcoming.text[:end]) / self.characters_per_second * self.compute_ratio
         return max(0.0, 1.2 * estimate + .35 - prepared_seconds)
 
 
-_PAUSE = re.compile(r"""(?:[。！？!?；;]+|…+|\.+(?=\s|$|[”’」』）》"'])|[，、：]|(?<!\d)[,:]|[,:](?!\d))[”’」』）》】)\]"']*""")
-_STRONG = "。！？!?；;.…"
-_DIALOGUE = re.compile(r"""[ \t\u200b\ufeff]*[“‘「『"]""")
-_ASCII_WORD = re.compile(r"[A-Za-z0-9]+(?:[.'’,-][A-Za-z0-9]+)*")
+def prepare_passage(window, frontend, target=DEFAULT_TARGET):
+    predicted = None
 
+    def predict(text):
+        nonlocal predicted
+        predicted = frontend.boundaries(text)
+        return predicted
 
-def nearest_word_end(text, start, target):
-    import logging
-    import jieba
-
-    # Tokenize only the local context. The offsets refer to the original EPUB.
-    jieba.setLogLevel(logging.WARNING)
-    window = text[start:start + target + 32]
-    for token in _ASCII_WORD.finditer(text, start, start + target):
-        if token.end() == start + target:
-            full = _ASCII_WORD.match(text, token.start())
-            return full.end() if token.start() == start else min(
-                (full.end(), token.start()), key=lambda i: abs(i - start - target))
-    for _, left, right in jieba.tokenize(window):
-        if right >= target:
-            return start + (left if left and target - left < right - target else right)
-    return start + len(window)
-
-
-def passage_end(text, start, target, first):
-    # Search beyond the target for a natural boundary before splitting a word.
-    ceiling = min(len(text), start + target + (18 if first else 24))
-    newline = text.find("\n", start, ceiling + 1)
-    stop = newline if newline >= 0 else ceiling
-    minimum = min(14, max(9, round(target * .6)))
-    candidates = []
-    for match in _PAUSE.finditer(text, start, min(len(text), stop + 8)):
-        if match.start() >= stop:
-            break
-        end = match.end()
-        if text[match.start()] in "：:" and _DIALOGUE.match(text, match.start() + 1):
-            continue
-        if end - start >= minimum:
-            penalty = 0 if text[match.start()] in _STRONG else (9 if first else 17)
-            candidates.append((abs(end - start - target) + penalty, end, penalty == 0))
-    if newline >= 0 or stop == len(text):
-        candidates.append((abs(stop - start - target), stop, True))
-    if candidates:
-        _, end, strong = min(candidates)
-        if strong:
-            return end
-        # Include a tiny tail when its natural boundary is only a few letters away.
-        return max((point for _, point, terminal in candidates if terminal and end < point <= end + 5), default=end)
-
-    # Keep explicit spaces, dictionary words and Latin tokens intact on long clauses.
-    spaces = [i for i in range(start + minimum, stop) if text[i].isspace()]
-    if spaces:
-        return min(spaces, key=lambda i: abs(i - (start + target)))
-    return nearest_word_end(text, start, target)
-
-
-def next_passage(book, position, limit, first=False):
-    doc, start = position
-    while doc < len(book.docs):
-        text, _ = book.document(doc)
-        while start < len(text) and not text[start].isalnum() and text[start] not in "“‘「『\"":
-            start += 1
-        if start >= len(text):
-            doc, start = doc + 1, 0
-            continue
-        end = passage_end(text, start, limit, first)
-        if not any(c.isalnum() for c in text[start:end]):
-            start = end
-            continue
-        return Passage(doc, start, end, text[start:end])
-    return None
+    end, added = choose_cut(window.text, window.more, target, predict=predict if frontend else None)
+    span = window.prefix(end)
+    text = frontend.prepare(span.text, predicted) if frontend is not None else span.text
+    return span, text + ("，" if added else "")
 
 
 def synthesis_worker(model_dir, requests, replies, epoch):
@@ -191,6 +131,8 @@ def synthesis_worker(model_dir, requests, replies, epoch):
         missing = missing_files(Path(model_dir))
         if missing:
             raise FileNotFoundError(f"模型文件缺失：{missing[0]}")
+        frontend_dir = Path(model_dir).resolve().parent / WETTS_PACK
+        frontend = None
         os.chdir(model_dir)
         files = Path(MODEL)
         reference = Path("reader-reference-distill-zh.wav")
@@ -217,25 +159,35 @@ def synthesis_worker(model_dir, requests, replies, epoch):
         request = requests.get()
         if request is None:
             break
-        generation, span, settings = request
+        generation, span, settings, target = request
         if generation != epoch.value:
             continue
         try:
             voice.num_steps = settings.steps
             voice.speed = settings.speed
-            utterance = spoken_text(span.text)
+            started = time.perf_counter()
+            if settings.use_prosody and HAN.search(span.text):
+                if frontend is None:
+                    try:
+                        frontend = ChineseProsody(frontend_dir)
+                    except Exception as exc:
+                        raise RuntimeError(f"WeTTS 加载失败。请检查 {frontend_dir}，"
+                                           f"或在语音调节中关闭自动断句。{exc}") from exc
+            span, text = prepare_passage(span, frontend if settings.use_prosody else None, target)
+            if epoch.value != generation:
+                continue
+            utterance = spoken_text(text)
             # Keep each app-selected passage together through the engine's
             # punctuation split/merge, including its closing quotation marks.
             unit_limit = str(min(160, len(utterance) + 1))
             voice.extra = {"min_words_in_sentence": unit_limit, "max_words_in_sentence": unit_limit,
                            "step_progress": "1", "guidance_scale": str(settings.guidance)}
-            started = time.perf_counter()
             result = engine.generate(utterance, voice, lambda samples, progress: int(epoch.value == generation))
             if epoch.value != generation:
                 continue
             samples = np.asarray(result.samples, dtype=np.float32)
             if not len(samples):
-                replies.put(("unvoiced", generation))
+                replies.put(("unvoiced", generation, span))
                 continue
             if result.sample_rate != RATE or not np.isfinite(samples).all():
                 raise ValueError("该片段未生成有效语音。")
@@ -248,12 +200,15 @@ def synthesis_worker(model_dir, requests, replies, epoch):
             gain = .94 / max(1.0, float(np.max(np.abs(samples))))
             pcm = (samples * (gain * 32767)).astype("<i2").tobytes()
             replies.put(("audio", generation, span, pcm, time.perf_counter() - started))
+        except SegmentError as exc:
+            replies.put(("segment_error", generation, str(exc)))
         except Exception as exc:
             replies.put(("error", generation, str(exc)))
 
 
 class AudioPlayer:
     def __init__(self):
+        self.volume = 100
         self.stream = None
         self.lock = Lock()
         self.blocks = deque()
@@ -293,6 +248,14 @@ class AudioPlayer:
                     self.offset = 0
             if written:
                 self.last_dac = dac + written / (2 * RATE)
+                volume = self.volume
+                if volume == 0:
+                    out[:written] = bytes(written)
+                elif volume < 100:
+                    samples = memoryview(out)[:written].cast("h")
+                    gain = (volume / 100) ** 2
+                    for i, sample in enumerate(samples):
+                        samples[i] = round(sample * gain)
 
     def buffered(self):
         with self.lock:
